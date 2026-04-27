@@ -1,6 +1,7 @@
 .env
 alembic.ini
 .venv/
+alembic/
 __pycache__/
 *.pyc
 *.pyo

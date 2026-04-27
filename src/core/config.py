@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     REPOS_BASE_PATH: str = "/var/lib/repomind/repos"
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+    GROQ_API_KEY: str = ""
 
     @field_validator("SECRET_KEY")
     @classmethod
