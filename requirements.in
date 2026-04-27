@@ -13,3 +13,4 @@ redis
 slowapi
 langchain-groq
 langchain-core
+neo4j

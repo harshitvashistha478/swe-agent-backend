@@ -133,6 +133,13 @@ def clone_repo_task(
             db.commit()
 
         logger.info("Clone complete | task=%s repo=%s", self.request.id, repo_name)
+
+        # ── Kick off graph KB build as a follow-up task ──────────────────────
+        # Import here to avoid circular import at module load time
+        from src.tasks.graph_tasks import build_graph_task
+        build_graph_task.delay(user_id=str(user_id), repo_name=repo_name)
+        logger.info("Graph KB task queued | user=%s repo=%s", user_id, repo_name)
+
         return {"status": "completed", "repo": repo_name}
 
     except ValueError as exc:

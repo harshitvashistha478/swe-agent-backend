@@ -14,7 +14,14 @@ class Settings(BaseSettings):
 
     REPOS_BASE_PATH: str = "/var/lib/repomind/repos"
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+
+    # Groq LLM
     GROQ_API_KEY: str = ""
+
+    # Neo4j — Graph Knowledge Base
+    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "repomind_graph"
 
     @field_validator("SECRET_KEY")
     @classmethod
@@ -32,6 +39,11 @@ class Settings(BaseSettings):
     @classmethod
     def parse_origins(cls, v):
         if isinstance(v, str):
+            # Handle both comma-separated strings and JSON arrays
+            v = v.strip()
+            if v.startswith("["):
+                import json
+                return json.loads(v)
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 

@@ -8,6 +8,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from src.api.routes import auth, repo
+from src.api.routes.graph import router as graph_router
 from src.core.config import settings
 from src.core.limiter import limiter
 from src.core.logging_config import setup_logging
@@ -41,6 +42,17 @@ app.add_middleware(
 API_PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(repo.router, prefix=API_PREFIX)
+app.include_router(graph_router, prefix=API_PREFIX)
+
+
+@app.on_event("startup")
+def on_startup():
+    """Run once at startup — set up Neo4j constraints and indexes."""
+    try:
+        from src.db.neo4j_session import setup_indexes
+        setup_indexes()
+    except Exception as exc:
+        logger.warning("Neo4j index setup failed (continuing): %s", exc)
 
 
 @app.get("/health", tags=["health"])
