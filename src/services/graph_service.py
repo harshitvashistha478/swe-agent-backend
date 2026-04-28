@@ -33,6 +33,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from src.utils.graph_extra_functions import extract_file_from_question, query_symbols_in_file
 from src.db.neo4j_session import get_session
 
 logger = logging.getLogger(__name__)
@@ -522,3 +523,42 @@ def query_file_dependents(user_id: str, repo_name: str, rel_path: str) -> list[d
     """
     with get_session() as s:
         return [dict(row) for row in s.run(cypher, repo_id=repo_id, file_id=file_id)]
+
+
+def build_graph_context(user_id: str, repo_name: str, question: str) -> str:
+    parts = []
+    q = question.lower()
+
+    file_path = extract_file_from_question(question)
+
+    # 🔹 functions in file
+    if file_path and "function" in q:
+        symbols = query_symbols_in_file(user_id, repo_name, file_path)
+
+        if symbols:
+            lines = [
+                f"{s['kind']} {s['name']} (line {s['line']})"
+                for s in symbols
+            ]
+            parts.append(f"Functions in {file_path}:\n" + "\n".join(lines))
+
+    # 🔹 calls inside file
+    if file_path and ("call" in q or "flow" in q):
+        calls = query_intrafile(user_id, repo_name, file_path)
+
+        if calls:
+            lines = [
+                f"{c['caller']} → {c['callee']} (line {c['line']})"
+                for c in calls
+            ]
+            parts.append(f"Call flow in {file_path}:\n" + "\n".join(lines))
+
+    # 🔹 file dependencies
+    if file_path and "import" in q:
+        deps = query_file_dependents(user_id, repo_name, file_path)
+
+        if deps:
+            lines = [d["importer"] for d in deps]
+            parts.append(f"Files importing {file_path}:\n" + "\n".join(lines))
+
+    return "\n\n".join(parts) if parts else "No relevant graph data found."

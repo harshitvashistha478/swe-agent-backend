@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
+from src.services.graph_service import build_graph_context
 from src.api.deps import get_current_user, get_db
 from src.core.config import settings
 from src.models.repo_job import RepoJob
@@ -143,19 +144,44 @@ def chat_with_repo(
 
     # Build repo context
     context = build_repo_context(repo_path)
+    graph_context = build_graph_context(user_id, req.repo_name, req.message)
     logger.debug("Built context for %s (%d chars)", req.repo_name, len(context))
 
     # Construct message list for the LLM
-    system_prompt = (
-        "You are RepoMind, an expert AI code assistant. "
-        "A developer has imported a Git repository and is asking you questions about it. "
-        "You have been given the following repository context (directory tree, README, and key config files).\n\n"
-        f"REPOSITORY: {req.repo_name}\n\n"
-        f"{context}\n\n"
-        "Answer questions clearly and concisely. "
-        "Use markdown formatting — code blocks for file paths, commands, and code snippets. "
-        "If asked for the tree structure, display it from the Directory Structure section above."
-    )
+    system_prompt = f"""
+        You are RepoMind, an expert AI code assistant.
+
+        You are given TWO TYPES of context:
+
+        ====================
+        📁 REPOSITORY CONTEXT
+        ====================
+        This includes directory structure, README, and config files.
+        Use this for understanding project structure and purpose.
+
+        {context}
+
+        ====================
+        🧠 GRAPH CONTEXT
+        ====================
+        This includes function calls and file dependencies.
+        Use this for understanding internal logic and relationships.
+
+        {graph_context}
+
+        ====================
+        INSTRUCTIONS
+        ====================
+        - Always prefer GRAPH CONTEXT for code-level reasoning.
+        - Use REPOSITORY CONTEXT for high-level understanding.
+        - If graph data is missing or insufficient, say so clearly.
+        - Do NOT hallucinate functions or relationships.
+
+        Answer the user's question clearly.
+    """
+
+    if graph_context == "No relevant graph data found.":
+        system_prompt += "\n\nNOTE: Graph data is unavailable, rely on repo context only."
 
     messages = [SystemMessage(content=system_prompt)]
 

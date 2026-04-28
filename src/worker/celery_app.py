@@ -1,5 +1,8 @@
 from celery import Celery
 from src.core.config import settings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 celery_app = Celery(
     "repomind",
