@@ -11,6 +11,7 @@ pydantic-settings
 celery[redis]
 redis
 slowapi
-langchain-groq
+langchain-ollama
 langchain-core
 neo4j
+requests

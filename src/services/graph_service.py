@@ -5,7 +5,10 @@ Schema
 ------
 Nodes
   (:Repository  {repo_id, repo_name, user_id})
-  (:File        {file_id, rel_path, language, repo_id})
+  (:File        {file_id, rel_path, language, repo_id,
+                 description, embedding})
+                 description — LLM-generated summary of the file's purpose
+                 embedding   — nomic-embed-text vector of the description
   (:Symbol      {symbol_id, name, kind, line, file_id, repo_id})
                  kind = "function" | "class" | "method"
 
@@ -24,6 +27,12 @@ Relationships
 Supported languages
   Python  — full (AST-based: symbols + calls + imports, relative import resolution)
   JS/TS   — partial (regex-based: symbols + imports only)
+
+Retrieval
+  At chat time the user's question is embedded with nomic-embed-text and a
+  Neo4j vector search finds the top-k most semantically relevant File nodes.
+  Their full content is read from disk and included in the LLM context,
+  giving precise, question-specific answers instead of a dump of everything.
 """
 from __future__ import annotations
 
@@ -33,10 +42,47 @@ import os
 import re
 from dataclasses import dataclass, field
 
+import requests
+
+from src.core.config import settings
 from src.utils.graph_extra_functions import extract_file_from_question, query_symbols_in_file
 from src.db.neo4j_session import get_session
 
 logger = logging.getLogger(__name__)
+
+# ── Ollama lazy singletons ────────────────────────────────────────────────────
+# Created on first use so the worker doesn't fail at import time if Ollama is
+# not running yet.
+
+_desc_llm = None
+_embedder = None
+
+
+def _get_desc_llm():
+    """Return (and lazily create) a ChatOllama for file-description generation."""
+    global _desc_llm
+    if _desc_llm is None:
+        from langchain_ollama import ChatOllama
+        _desc_llm = ChatOllama(
+            model=settings.OLLAMA_DESC_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+            temperature=0,
+            num_predict=300,   # descriptions need at most ~200 tokens
+        )
+    return _desc_llm
+
+
+def _get_embedder():
+    """Return (and lazily create) an OllamaEmbeddings for nomic-embed-text."""
+    global _embedder
+    if _embedder is None:
+        from langchain_ollama import OllamaEmbeddings
+        _embedder = OllamaEmbeddings(
+            model=settings.OLLAMA_EMBED_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+        )
+    return _embedder
+
 
 # ── Language detection ────────────────────────────────────────────────────────
 
@@ -89,9 +135,11 @@ class CallInfo:
 class FileParseResult:
     rel_path: str
     language: str
-    symbols: list[SymbolInfo] = field(default_factory=list)
-    imports: list[ImportInfo] = field(default_factory=list)
-    calls:   list[CallInfo]   = field(default_factory=list)
+    symbols:     list[SymbolInfo]  = field(default_factory=list)
+    imports:     list[ImportInfo]  = field(default_factory=list)
+    calls:       list[CallInfo]    = field(default_factory=list)
+    description: str               = ""          # LLM-generated summary
+    embedding:   list[float]       = field(default_factory=list)  # nomic-embed-text vector
 
 
 # ── Python parser ─────────────────────────────────────────────────────────────
@@ -270,6 +318,88 @@ def _resolve_js_import(importing_rel: str, spec: str, repo_path: str) -> str | N
     return None
 
 
+# ── Description & embedding helpers ──────────────────────────────────────────
+
+def _read_full_file(abs_path: str) -> str:
+    """Read the entire file for description generation (no char limit)."""
+    try:
+        with open(abs_path, encoding="utf-8", errors="ignore") as fh:
+            return fh.read()
+    except Exception as exc:
+        logger.debug("Could not read %s: %s", abs_path, exc)
+        return ""
+
+
+def _fallback_description(pr: FileParseResult) -> str:
+    """
+    Heuristic description used when the LLM call fails or Ollama is offline.
+    Synthesised from the symbols and imports already extracted by the parser.
+    """
+    parts: list[str] = []
+    if pr.symbols:
+        counts: dict[str, int] = {}
+        for s in pr.symbols:
+            counts[s.kind] = counts.get(s.kind, 0) + 1
+        summary = ", ".join(
+            f"{v} {k}{'s' if v > 1 else ''}" for k, v in counts.items()
+        )
+        parts.append(f"Defines {summary}.")
+    if pr.imports:
+        external = [
+            i.module for i in pr.imports if not i.is_relative and i.module
+        ][:5]
+        if external:
+            parts.append(f"Uses: {', '.join(external)}.")
+    return " ".join(parts) if parts else f"{pr.language.capitalize()} source file."
+
+
+def _generate_file_description(content: str, rel_path: str) -> str:
+    """
+    Ask the small local Ollama model for a 2-3 sentence description of a file.
+
+    The *complete* file content is sent so the model sees imports, class
+    hierarchies, docstrings, and logic — nothing is truncated.
+    Falls back to an empty string on any error (caller uses _fallback_description).
+    """
+    prompt = (
+        "You are a code analyst. Read the source file below carefully.\n"
+        "Write a concise description of 2-3 sentences that covers:\n"
+        "1. The purpose of this file and what it does.\n"
+        "2. The key functions, classes, or logic it defines.\n"
+        "3. Its role in the broader codebase.\n\n"
+        f"File path: {rel_path}\n\n"
+        "```\n"
+        f"{content}\n"
+        "```\n\n"
+        "Write ONLY the description — no headings, no bullet points, no extra text."
+    )
+    try:
+        from langchain_core.messages import HumanMessage
+        llm = _get_desc_llm()
+        response = llm.invoke([HumanMessage(content=prompt)])
+        desc = response.content.strip()
+        logger.debug("Description for %s: %s", rel_path, desc[:80])
+        return desc
+    except Exception as exc:
+        logger.warning("LLM description failed for %s: %s", rel_path, exc)
+        return ""
+
+
+def _generate_embedding(text: str) -> list[float]:
+    """
+    Embed `text` using nomic-embed-text via the local Ollama instance.
+    Returns a 768-dimensional float list, or [] on failure.
+    """
+    if not text:
+        return []
+    try:
+        embedder = _get_embedder()
+        return embedder.embed_query(text)
+    except Exception as exc:
+        logger.warning("Embedding generation failed: %s", exc)
+        return []
+
+
 # ── Repo walker ───────────────────────────────────────────────────────────────
 
 def _collect_files(repo_path: str) -> list[tuple[str, str]]:
@@ -301,7 +431,11 @@ SET r.repo_name = $repo_name, r.user_id = $user_id
 
 _MERGE_FILE = """
 MERGE (f:File {file_id: $file_id})
-SET f.rel_path = $rel_path, f.language = $language, f.repo_id = $repo_id
+SET f.rel_path    = $rel_path,
+    f.language    = $language,
+    f.repo_id     = $repo_id,
+    f.description = $description,
+    f.embedding   = $embedding
 WITH f
 MATCH (r:Repository {repo_id: $repo_id})
 MERGE (f)-[:BELONGS_TO]->(r)
@@ -371,26 +505,45 @@ def build_repo_graph(repo_path: str, user_id: str, repo_name: str) -> dict:
     with get_session() as s:
         s.run(_MERGE_REPO, repo_id=repo_id, repo_name=repo_name, user_id=user_id)
 
-    # 3. Collect + parse all source files
+    # 3. Collect + parse all source files, then generate descriptions & embeddings
     files = _collect_files(repo_path)
     parse_results: list[FileParseResult] = []
+    total = len(files)
 
-    for abs_path, rel_path in files:
-        ext = os.path.splitext(rel_path)[1].lower()
+    for idx, (abs_path, rel_path) in enumerate(files, start=1):
+        ext  = os.path.splitext(rel_path)[1].lower()
         lang = _language(ext)
         if lang == "python":
             pr = _parse_python(abs_path, rel_path, repo_path)
         else:
             pr = _parse_js(abs_path, rel_path, repo_path)
+
+        # ── Description (full file → small local model) ───────────────────
+        logger.info("[%d/%d] Describing %s", idx, total, rel_path)
+        full_content = _read_full_file(abs_path)
+        if full_content:
+            pr.description = _generate_file_description(full_content, rel_path)
+        if not pr.description:
+            pr.description = _fallback_description(pr)
+
+        # ── Embedding (description → nomic-embed-text) ────────────────────
+        pr.embedding = _generate_embedding(pr.description)
+
         parse_results.append(pr)
 
-    # 4. Write File nodes
+    # 4. Write File nodes (with description + embedding)
     with get_session() as s:
         for pr in parse_results:
             fid = _file_id(repo_id, pr.rel_path)
-            s.run(_MERGE_FILE,
-                  file_id=fid, rel_path=pr.rel_path,
-                  language=pr.language, repo_id=repo_id)
+            s.run(
+                _MERGE_FILE,
+                file_id=fid,
+                rel_path=pr.rel_path,
+                language=pr.language,
+                repo_id=repo_id,
+                description=pr.description,
+                embedding=pr.embedding,
+            )
 
     # 5. Write Symbol nodes
     symbol_count = 0
@@ -525,40 +678,128 @@ def query_file_dependents(user_id: str, repo_name: str, rel_path: str) -> list[d
         return [dict(row) for row in s.run(cypher, repo_id=repo_id, file_id=file_id)]
 
 
-def build_graph_context(user_id: str, repo_name: str, question: str) -> str:
-    parts = []
-    q = question.lower()
+def vector_search_files(
+    user_id: str,
+    repo_name: str,
+    query_embedding: list[float],
+    top_k: int = 5,
+) -> list[dict]:
+    """
+    Return the top-k File nodes whose description embedding is most similar
+    to `query_embedding`, filtered to this specific repo.
 
+    We fetch `top_k * 6` candidates from the global index so that after
+    filtering by repo_id we still have enough results.
+
+    Each returned dict: {rel_path, description, score}
+    """
+    repo_id = _repo_id(user_id, repo_name)
+    cypher = """
+    CALL db.index.vector.queryNodes('file_embedding_idx', $candidate_count, $embedding)
+    YIELD node AS f, score
+    WHERE f.repo_id = $repo_id
+    RETURN f.rel_path   AS rel_path,
+           f.description AS description,
+           score
+    ORDER BY score DESC
+    LIMIT $top_k
+    """
+    try:
+        with get_session() as s:
+            rows = s.run(
+                cypher,
+                candidate_count=top_k * 6,
+                embedding=query_embedding,
+                repo_id=repo_id,
+                top_k=top_k,
+            )
+            return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("Vector search failed (index may not exist yet): %s", exc)
+        return []
+
+
+def build_graph_context(
+    user_id: str,
+    repo_name: str,
+    question: str,
+    repo_path: str | None = None,
+) -> str:
+    """
+    Build a rich, question-specific context string for the LLM.
+
+    Strategy
+    --------
+    1. Embed the question with nomic-embed-text.
+    2. Run a vector search against File.embedding to find the top-5 most
+       semantically relevant files.
+    3. For each of the top-3 hits read the *full* file from disk and include it.
+    4. Append intrafile call-graph info for those files.
+    5. Fall back to keyword-based heuristics when embeddings are unavailable.
+    """
+    parts: list[str] = []
+
+    # ── Primary path: vector retrieval ───────────────────────────────────────
+    question_embedding = _generate_embedding(question)
+
+    if question_embedding:
+        relevant = vector_search_files(user_id, repo_name, question_embedding, top_k=5)
+
+        if relevant:
+            # Overview table of the most relevant files
+            header_lines = [
+                f"- `{f['rel_path']}` (score {f['score']:.3f}): {f['description']}"
+                for f in relevant
+            ]
+            parts.append("## Semantically Relevant Files\n" + "\n".join(header_lines))
+
+            # Full file content for top-3 hits
+            if repo_path:
+                for f in relevant[:3]:
+                    abs_path = os.path.join(
+                        repo_path, f["rel_path"].replace("/", os.sep)
+                    )
+                    content = _read_full_file(abs_path)
+                    if content:
+                        parts.append(
+                            f"## Full source: {f['rel_path']}\n"
+                            f"```\n{content}\n```"
+                        )
+
+            # Intrafile call graph for top-3 hits
+            for f in relevant[:3]:
+                calls = query_intrafile(user_id, repo_name, f["rel_path"])
+                if calls:
+                    call_lines = [
+                        f"  {c['caller']} → {c['callee']} (line {c['line']})"
+                        for c in calls[:20]
+                    ]
+                    parts.append(
+                        f"## Call graph: {f['rel_path']}\n" + "\n".join(call_lines)
+                    )
+
+            return "\n\n".join(parts)
+
+    # ── Fallback path: keyword heuristics (no embeddings available) ──────────
+    logger.info("Falling back to keyword-based graph context")
+    q = question.lower()
     file_path = extract_file_from_question(question)
 
-    # 🔹 functions in file
     if file_path and "function" in q:
         symbols = query_symbols_in_file(user_id, repo_name, file_path)
-
         if symbols:
-            lines = [
-                f"{s['kind']} {s['name']} (line {s['line']})"
-                for s in symbols
-            ]
+            lines = [f"{s['kind']} {s['name']} (line {s['line']})" for s in symbols]
             parts.append(f"Functions in {file_path}:\n" + "\n".join(lines))
 
-    # 🔹 calls inside file
     if file_path and ("call" in q or "flow" in q):
         calls = query_intrafile(user_id, repo_name, file_path)
-
         if calls:
-            lines = [
-                f"{c['caller']} → {c['callee']} (line {c['line']})"
-                for c in calls
-            ]
+            lines = [f"{c['caller']} → {c['callee']} (line {c['line']})" for c in calls]
             parts.append(f"Call flow in {file_path}:\n" + "\n".join(lines))
 
-    # 🔹 file dependencies
     if file_path and "import" in q:
         deps = query_file_dependents(user_id, repo_name, file_path)
-
         if deps:
-            lines = [d["importer"] for d in deps]
-            parts.append(f"Files importing {file_path}:\n" + "\n".join(lines))
+            parts.append(f"Files importing {file_path}:\n" + "\n".join(d["importer"] for d in deps))
 
     return "\n\n".join(parts) if parts else "No relevant graph data found."

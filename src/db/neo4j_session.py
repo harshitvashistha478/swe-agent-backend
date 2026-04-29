@@ -62,4 +62,24 @@ def setup_indexes() -> None:
     with get_session() as session:
         for stmt in constraints + indexes:
             session.run(stmt)
-    logger.info("Neo4j constraints and indexes ensured")
+
+    # Vector index for semantic file retrieval (requires Neo4j 5.11+).
+    # nomic-embed-text produces 768-dimensional vectors; cosine similarity
+    # is the right metric for normalised text embeddings.
+    vector_index = """
+    CREATE VECTOR INDEX file_embedding_idx IF NOT EXISTS
+    FOR (f:File) ON (f.embedding)
+    OPTIONS {indexConfig: {
+      `vector.dimensions`: 768,
+      `vector.similarity_function`: 'cosine'
+    }}
+    """
+    try:
+        with get_session() as session:
+            session.run(vector_index)
+        logger.info("Neo4j vector index 'file_embedding_idx' ensured")
+    except Exception as exc:
+        # Older Neo4j versions don't support vector indexes — log and continue.
+        logger.warning(
+            "Could not create vector index (Neo4j 5.11+ required): %s", exc
+        )

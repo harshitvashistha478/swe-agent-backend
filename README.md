@@ -96,3 +96,7 @@ celery -A src.worker.celery_app worker --loglevel=info --concurrency=4
 * Integrate ingestion pipeline after repo cloning
 
 ---
+
+ollama pull qwen2.5-coder:0.5b   # file descriptions (fast, tiny)
+ollama pull nomic-embed-text       # embeddings (768-dim)
+ollama pull llama3.1:8b            # chat Q&A

@@ -3,7 +3,7 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from src.services.graph_service import build_graph_context
@@ -109,15 +109,18 @@ def chat_with_repo(
     user_id: str = Depends(get_current_user),
 ):
     """
-    Answer a question about a cloned repository using Groq LLM.
-    Supports multi-turn conversation via the `history` field.
-    """
-    if not settings.GROQ_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GROQ_API_KEY is not configured on the server.",
-        )
+    Answer a question about a cloned repository using a local Ollama model.
 
+    Context pipeline
+    ----------------
+    1. build_repo_context  — directory tree + README + key config files
+       (gives the LLM a high-level map of the project)
+    2. build_graph_context — embeds the question, runs a Neo4j vector search,
+       retrieves the top-5 most relevant files by description similarity,
+       includes their full source + call-graph edges
+       (gives the LLM precise, question-specific code context)
+    3. Conversation history is prepended so the model can answer follow-ups.
+    """
     # Verify the repo belongs to this user and is fully cloned
     job = (
         db.query(RepoJob)
@@ -139,49 +142,51 @@ def chat_with_repo(
     if not os.path.isdir(repo_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Repository files not found on disk at expected path.",
+            detail="Repository files not found on disk at expected path.",
         )
 
-    # Build repo context
-    context = build_repo_context(repo_path)
-    graph_context = build_graph_context(user_id, req.repo_name, req.message)
-    logger.debug("Built context for %s (%d chars)", req.repo_name, len(context))
+    # ── Build context ─────────────────────────────────────────────────────────
+    overview_context = build_repo_context(repo_path)
+    # Pass repo_path so the graph service can read full file content from disk
+    retrieved_context = build_graph_context(
+        user_id, req.repo_name, req.message, repo_path
+    )
+    logger.debug(
+        "Context built for %s | overview=%d chars | retrieved=%d chars",
+        req.repo_name, len(overview_context), len(retrieved_context),
+    )
 
-    # Construct message list for the LLM
-    system_prompt = f"""
-        You are RepoMind, an expert AI code assistant.
+    # ── System prompt ─────────────────────────────────────────────────────────
+    no_retrieved = retrieved_context == "No relevant graph data found."
 
-        You are given TWO TYPES of context:
+    system_prompt = f"""You are RepoMind, an expert AI code assistant specialising in codebase analysis.
 
-        ====================
-        📁 REPOSITORY CONTEXT
-        ====================
-        This includes directory structure, README, and config files.
-        Use this for understanding project structure and purpose.
+====================
+📁 REPOSITORY OVERVIEW
+====================
+High-level directory structure, README, and key config files.
+Use this to understand the project's purpose and layout.
 
-        {context}
+{overview_context}
 
-        ====================
-        🧠 GRAPH CONTEXT
-        ====================
-        This includes function calls and file dependencies.
-        Use this for understanding internal logic and relationships.
+====================
+🔍 RETRIEVED FILE CONTEXT
+====================
+{"These files were selected by semantic similarity to the user's question. " +
+ "They include full source code and call-graph edges — prioritise this for code-level answers."
+ if not no_retrieved else
+ "No semantically relevant files were found. The graph index may still be building — rely on the overview above."}
 
-        {graph_context}
+{retrieved_context}
 
-        ====================
-        INSTRUCTIONS
-        ====================
-        - Always prefer GRAPH CONTEXT for code-level reasoning.
-        - Use REPOSITORY CONTEXT for high-level understanding.
-        - If graph data is missing or insufficient, say so clearly.
-        - Do NOT hallucinate functions or relationships.
-
-        Answer the user's question clearly.
-    """
-
-    if graph_context == "No relevant graph data found.":
-        system_prompt += "\n\nNOTE: Graph data is unavailable, rely on repo context only."
+====================
+INSTRUCTIONS
+====================
+- Ground every answer in the context provided above.
+- Reference specific file paths, function names, and line numbers where relevant.
+- If the answer cannot be determined from the context, say so explicitly — do NOT hallucinate.
+- Keep answers concise and developer-friendly.
+"""
 
     messages = [SystemMessage(content=system_prompt)]
 
@@ -193,20 +198,24 @@ def chat_with_repo(
 
     messages.append(HumanMessage(content=req.message))
 
-    # Call Groq
+    # ── Call local Ollama ─────────────────────────────────────────────────────
     try:
-        llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            groq_api_key=settings.GROQ_API_KEY,
+        llm = ChatOllama(
+            model=settings.OLLAMA_CHAT_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
             temperature=0.3,
-            max_tokens=1024,
+            num_predict=2048,
         )
         response = llm.invoke(messages)
     except Exception as exc:
-        logger.exception("Groq LLM call failed")
+        logger.exception("Ollama LLM call failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM call failed: {exc}",
+            detail=(
+                f"Ollama call failed: {exc}. "
+                f"Make sure Ollama is running at {settings.OLLAMA_BASE_URL} "
+                f"and the model '{settings.OLLAMA_CHAT_MODEL}' is pulled."
+            ),
         )
 
     return ChatResponse(answer=response.content)

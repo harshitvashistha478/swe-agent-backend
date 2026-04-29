@@ -15,8 +15,14 @@ class Settings(BaseSettings):
     REPOS_BASE_PATH: str = "/var/lib/repomind/repos"
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
 
-    # Groq LLM
-    GROQ_API_KEY: str = ""
+    # Ollama — Local LLM
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # Model used for chat Q&A (larger, higher quality)
+    OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
+    # Model used to embed descriptions for vector search
+    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
+    # Small/fast model used to generate per-file descriptions at graph-build time
+    OLLAMA_DESC_MODEL: str = "qwen2.5-coder:0.5b"
 
     # Neo4j — Graph Knowledge Base
     NEO4J_URI: str = "bolt://localhost:7687"
