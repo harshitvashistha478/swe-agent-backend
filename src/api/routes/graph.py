@@ -1,6 +1,7 @@
 """
 Graph Knowledge Base query endpoints.
 
+GET /repo/graph/viz?repo_name=owner/repo  — interfile edges for structural visualization
 GET /repo/graph/{repo_name}/interfile   — file-to-file import edges
 GET /repo/graph/{repo_name}/intrafile   — function-to-function call edges (whole repo)
 GET /repo/graph/{repo_name}/intrafile?file=src/main.py  — for a single file
@@ -45,6 +46,27 @@ def _verify_repo_done(repo_name: str, user_id: str, db: Session) -> RepoJob:
             detail="Repository not found or not yet fully cloned.",
         )
     return job
+
+
+@router.get("/viz")
+def get_viz_structure(
+    repo_name: str = Query(..., description="Full repo name, e.g. owner/repo"),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """
+    Return interfile edges for the structural graph visualization.
+    Uses a query parameter instead of a path parameter so that repo names
+    containing slashes (owner/repo) are handled correctly.
+    Shape: {repo, edges: [{source, target, symbols, line}]}
+    """
+    _verify_repo_done(repo_name, user_id, db)
+    try:
+        edges = query_interfile(str(user_id), repo_name)
+        return {"repo": repo_name, "edges": edges}
+    except Exception as exc:
+        logger.exception("viz structure query failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/{repo_name}/interfile")
