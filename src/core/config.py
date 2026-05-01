@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     # Small/fast model used to generate per-file descriptions at graph-build time
     OLLAMA_DESC_MODEL: str = "qwen2.5-coder:0.5b"
+    
 
     # Neo4j — Graph Knowledge Base
     NEO4J_URI: str = "bolt://localhost:7687"
