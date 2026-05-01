@@ -8,7 +8,7 @@ celery_app = Celery(
     "repomind",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["src.tasks.repo_tasks", "src.tasks.graph_tasks"],
+    include=["src.tasks.repo_tasks", "src.tasks.graph_tasks", "src.tasks.analysis_tasks"],
 )
 
 celery_app.conf.update(

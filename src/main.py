@@ -9,6 +9,7 @@ from slowapi.errors import RateLimitExceeded
 
 from src.api.routes import auth, repo
 from src.api.routes.graph import router as graph_router
+from src.api.routes.analyse import router as analyse_router
 from src.core.config import settings
 from src.core.limiter import limiter
 from src.core.logging_config import setup_logging
@@ -43,6 +44,7 @@ API_PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(repo.router, prefix=API_PREFIX)
 app.include_router(graph_router, prefix=API_PREFIX)
+app.include_router(analyse_router, prefix=API_PREFIX)
 
 
 @app.on_event("startup")

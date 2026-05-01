@@ -1,11 +1,15 @@
 """
 Analysis endpoints.
 
-POST /repo/analyse/{repo_name}         — trigger analysis, returns run_id
-GET  /repo/analyse/{repo_name}/status  — poll run status + summary
-GET  /repo/analyse/{repo_name}/issues  — paginated issues list
-GET  /repo/analyse/{repo_name}/issues?severity=critical — filter by severity
-GET  /repo/analyse/{repo_name}/issues?file=src/foo.py   — filter by file
+POST /repo/analyse?repo_name=owner/repo         — trigger analysis, returns run_id
+GET  /repo/analyse/status?repo_name=owner/repo  — poll run status + summary
+GET  /repo/analyse/issues?repo_name=owner/repo  — paginated issues list
+GET  /repo/analyse/issues?repo_name=owner/repo&severity=critical — filter by severity
+GET  /repo/analyse/issues?repo_name=owner/repo&file=src/foo.py   — filter by file
+
+repo_name is passed as a query parameter (not a path segment) so that
+repo names containing slashes (e.g. "owner/repo") do not cause 404s
+due to URL path-segment encoding issues.
 """
 import logging
 
@@ -22,7 +26,7 @@ router = APIRouter(prefix="/repo/analyse", tags=["analyse"])
 
 
 def _require_done_repo(repo_name: str, user_id: str, db: Session) -> RepoJob:
-    """Reuse your existing pattern from graph.py."""
+    """Return the DONE RepoJob or raise 404."""
     job = (
         db.query(RepoJob)
         .filter(
@@ -40,16 +44,16 @@ def _require_done_repo(repo_name: str, user_id: str, db: Session) -> RepoJob:
     return job
 
 
-@router.post("/{repo_name}", status_code=status.HTTP_202_ACCEPTED)
+@router.post("", status_code=status.HTTP_202_ACCEPTED)
 def trigger_analysis(
-    repo_name: str,
-    db:      Session = Depends(get_db),
-    user_id: str     = Depends(get_current_user),
+    repo_name: str     = Query(..., description="Full repo name, e.g. owner/repo"),
+    db:        Session = Depends(get_db),
+    user_id:   str     = Depends(get_current_user),
 ):
     """Queue a full analysis run for a cloned + graph-indexed repo."""
     _require_done_repo(repo_name, user_id, db)
 
-    # Cancel any existing in-progress run for this repo+user
+    # Reject if a run is already in progress
     existing = (
         db.query(AnalysisRun)
         .filter(
@@ -76,11 +80,11 @@ def trigger_analysis(
     return {"message": "Analysis started", "run_id": run.id}
 
 
-@router.get("/{repo_name}/status")
+@router.get("/status")
 def get_analysis_status(
-    repo_name: str,
-    db:      Session = Depends(get_db),
-    user_id: str     = Depends(get_current_user),
+    repo_name: str     = Query(..., description="Full repo name, e.g. owner/repo"),
+    db:        Session = Depends(get_db),
+    user_id:   str     = Depends(get_current_user),
 ):
     """Poll the latest analysis run for this repo."""
     run = (
@@ -104,16 +108,16 @@ def get_analysis_status(
     }
 
 
-@router.get("/{repo_name}/issues")
+@router.get("/issues")
 def get_analysis_issues(
-    repo_name: str,
-    severity: str | None = Query(default=None),
-    file:     str | None = Query(default=None),
-    pass_type: str | None = Query(default=None),
-    limit:    int         = Query(default=100, le=500),
-    offset:   int         = Query(default=0),
-    db:      Session = Depends(get_db),
-    user_id: str     = Depends(get_current_user),
+    repo_name:  str           = Query(..., description="Full repo name, e.g. owner/repo"),
+    severity:   str | None    = Query(default=None),
+    file:       str | None    = Query(default=None),
+    pass_type:  str | None    = Query(default=None),
+    limit:      int           = Query(default=100, le=500),
+    offset:     int           = Query(default=0),
+    db:         Session       = Depends(get_db),
+    user_id:    str           = Depends(get_current_user),
 ):
     """
     Return paginated issues for the latest completed analysis run.
@@ -148,16 +152,16 @@ def get_analysis_issues(
         "total":  total,
         "issues": [
             {
-                "id":           i.id,
-                "file_path":    i.file_path,
-                "symbol_name":  i.symbol_name,
-                "pass_type":    i.pass_type,
-                "severity":     i.severity,
-                "issue_type":   i.issue_type,
-                "description":  i.description,
+                "id":            i.id,
+                "file_path":     i.file_path,
+                "symbol_name":   i.symbol_name,
+                "pass_type":     i.pass_type,
+                "severity":      i.severity,
+                "issue_type":    i.issue_type,
+                "description":   i.description,
                 "suggested_fix": i.suggested_fix,
-                "line_number":  i.line_number,
-                "is_resolved":  i.is_resolved,
+                "line_number":   i.line_number,
+                "is_resolved":   i.is_resolved,
             }
             for i in issues
         ],
