@@ -1,14 +1,26 @@
 """
-Analysis service — multi-pass Ollama analysis using the existing Neo4j graph.
+Analysis service — function-level, bottom-up Ollama analysis using the Neo4j graph.
 
-Passes
-------
-  security    → auth, injection, secrets, missing validation
-  performance → N+1 patterns, blocking I/O, redundant work
-  quality     → dead code, error handling, complexity, types
+Strategy
+--------
+1.  Pull every Symbol (function/class/method) for the repo from Neo4j,
+    together with its file path and line range.
+2.  Build the intrafile call graph and topologically sort it so that
+    leaf functions (those that call nothing within the codebase) come first
+    and top-level orchestrators come last.
+3.  Analyse each function in that order.  By the time we analyse a caller,
+    all of its callees are already done — their summaries are passed into the
+    prompt so the LLM has real behavioural context, not just names.
+4.  After all functions are done, run the cross-file architectural checks
+    (circular imports, high coupling, dead code) exactly as before.
 
-Each pass sends only the relevant code + graph context to the model
-and forces structured JSON output so results are always parseable.
+Context window discipline
+-------------------------
+- Function source is extracted by line range (never the whole file).
+- Source is capped at MAX_FUNC_CHARS chars, cut at a line boundary.
+- Callee summaries are compact dicts — name + one-sentence description +
+  issue count — not full source.
+- The total prompt stays well within a 4 096-token local model window.
 """
 from __future__ import annotations
 
@@ -18,202 +30,227 @@ import os
 import re
 from typing import Generator
 
+import httpx
+
 from src.core.config import settings
 from src.utils.agents_functions import (
+    store_function_description,
     find_circular_imports,
     find_dead_code,
     find_deeply_coupled_files,
-    get_all_files_for_repo,
-    get_callers_for_file,
-    get_symbols_for_file,
+    get_all_call_edges,
+    get_all_symbols_for_repo,
+    get_callee_summaries,
+    topological_sort_functions,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Ollama client (raw requests, same pattern as graph_service) ───────────────
+# Shared HTTP client — connection-pooled, single timeout config
+_http = httpx.Client(timeout=120)
+
+# Maximum characters of function source sent to the LLM.
+# Cut at a line boundary so the model never sees half a statement.
+MAX_FUNC_CHARS = 4_000
+
+
+# ── Ollama client ─────────────────────────────────────────────────────────────
 
 def _ollama_chat(prompt: str, model: str | None = None) -> str:
     """
     Send a prompt to Ollama and return the response text.
-    Forces JSON mode via the format param so the model always outputs parseable JSON.
-    Falls back gracefully if Ollama is unreachable.
+    Forces JSON mode so the model always outputs parseable JSON.
+    Returns empty string on failure (caller handles the fallback).
     """
-    import requests
     model = model or settings.OLLAMA_CHAT_MODEL
     try:
-        resp = requests.post(
+        resp = _http.post(
             f"{settings.OLLAMA_BASE_URL}/api/generate",
             json={"model": model, "prompt": prompt, "format": "json", "stream": False},
-            timeout=120,
         )
         resp.raise_for_status()
         return resp.json().get("response", "")
     except Exception as exc:
-        logger.warning("Ollama call failed for model %s: %s", model, exc)
+        logger.warning("Ollama call failed (model=%s): %s", model, exc)
         return ""
 
 
-# ── Prompt templates ──────────────────────────────────────────────────────────
-
-_SECURITY_PROMPT = """You are a senior backend security engineer.
-Analyse the code below for security vulnerabilities only.
-
-FILE: {file_path}
-SYMBOLS DEFINED: {symbols}
-IMPORTED BY: {imported_by}
-
-CODE:
-{code}
-Look for: SQL/NoSQL injection, hardcoded secrets, missing input validation,
-broken auth/authz, insecure deserialization, path traversal, missing rate limiting.
-
-Respond ONLY in this exact JSON (no markdown, no extra text):
-{{
-  "issues": [
-    {{
-      "type": "<issue_type>",
-      "severity": "critical|high|medium|low",
-      "line": <int_or_null>,
-      "description": "<what is wrong>",
-      "fix": "<concrete fix>",
-      "why": "<security impact>"
-    }}
-  ]
-}}
-If no issues found return {{"issues": []}}
-"""
-
-_PERFORMANCE_PROMPT = """You are a senior backend performance engineer.
-Analyse the code below for performance problems only.
-
-FILE: {file_path}
-SYMBOLS DEFINED: {symbols}
-CALL GRAPH (who calls who in this file): {call_graph}
-
-CODE:
-{code}
-Look for: N+1 database queries, synchronous blocking I/O in async context,
-missing caching, repeated expensive computation, unneeded DB columns fetched,
-missing pagination on list queries.
-
-Respond ONLY in this exact JSON (no markdown, no extra text):
-{{
-  "issues": [
-    {{
-      "type": "<issue_type>",
-      "severity": "critical|high|medium|low",
-      "line": <int_or_null>,
-      "description": "<what is wrong>",
-      "fix": "<concrete fix>",
-      "why": "<performance impact>"
-    }}
-  ]
-}}
-If no issues found return {{"issues": []}}
-"""
-
-_QUALITY_PROMPT = """You are a senior backend engineer doing a code quality review.
-Analyse the code below for quality issues only.
-
-FILE: {file_path}
-SYMBOLS DEFINED: {symbols}
-
-CODE:
-{code}
-Look for: missing error handling, overly complex functions (>50 lines),
-missing type hints, hardcoded magic values, functions doing too many things,
-missing docstrings on public functions, inconsistent naming.
-
-Respond ONLY in this exact JSON (no markdown, no extra text):
-{{
-  "issues": [
-    {{
-      "type": "<issue_type>",
-      "severity": "critical|high|medium|low",
-      "line": <int_or_null>,
-      "description": "<what is wrong>",
-      "fix": "<concrete fix>",
-      "why": "<quality impact>"
-    }}
-  ]
-}}
-If no issues found return {{"issues": []}}
-"""
-
-PASSES = [
-    ("security",    _SECURITY_PROMPT),
-    ("performance", _PERFORMANCE_PROMPT),
-    ("quality",     _QUALITY_PROMPT),
-]
-
-
-# ── JSON extraction (handles models that wrap with markdown fences) ────────────
+# ── JSON extraction ───────────────────────────────────────────────────────────
 
 def _extract_json(raw: str) -> dict:
     raw = raw.strip()
-    # Strip ```json ... ``` fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        logger.debug("Could not parse JSON from model output: %s", raw[:200])
-        return {"issues": []}
+        logger.debug("Could not parse JSON from model output: %.200s", raw)
+        return {}
 
 
-# ── Per-file analysis ─────────────────────────────────────────────────────────
+# ── Function source extraction ────────────────────────────────────────────────
 
-def _analyse_file(
-    file_info: dict,
-    user_id: str,
-    repo_name: str,
-    repo_path: str,
-) -> list[dict]:
-    """Run all three passes on a single file. Returns a flat list of issue dicts."""
-    rel_path = file_info["rel_path"]
-    abs_path = os.path.join(repo_path, rel_path.replace("/", os.sep))
-
-    # Read source code — skip if unreadable
+def _extract_source(abs_path: str, start_line: int, end_line: int) -> str:
+    """
+    Read lines [start_line, end_line] (1-indexed, inclusive) from a file.
+    Returns empty string if the file cannot be read or the range is invalid.
+    """
     try:
         with open(abs_path, encoding="utf-8", errors="ignore") as fh:
-            code = fh.read()
+            all_lines = fh.readlines()
     except Exception:
-        logger.debug("Skipping unreadable file: %s", rel_path)
-        return []
+        return ""
 
-    if not code.strip():
-        return []
+    # Clamp to actual file length
+    start = max(0, start_line - 1)
+    end   = min(len(all_lines), end_line)
+    return "".join(all_lines[start:end])
 
-    # Gather graph context (already in Neo4j from the build step)
-    symbols   = get_symbols_for_file(user_id, repo_name, rel_path)
-    importers = get_callers_for_file(user_id, repo_name, rel_path)
 
-    sym_names  = [f"{s['kind']} {s['name']} (line {s['line']})" for s in symbols]
-    importer_names = [i["importer"] for i in importers]
+def _truncate_at_line_boundary(code: str, max_chars: int = MAX_FUNC_CHARS) -> tuple[str, bool]:
+    """
+    Truncate `code` to at most `max_chars` characters, always cutting at
+    a newline so the model never sees a broken statement.
 
-    all_issues: list[dict] = []
+    Returns (truncated_code, was_truncated).
+    """
+    if len(code) <= max_chars:
+        return code, False
+    cut = code[:max_chars].rfind("\n")
+    if cut <= 0:
+        cut = max_chars
+    return code[:cut] + "\n# ... [truncated — function too large for context window]", True
 
-    for pass_name, template in PASSES:
-        prompt = template.format(
-            file_path   = rel_path,
-            symbols     = ", ".join(sym_names) or "none",
-            imported_by = ", ".join(importer_names) or "none",
-            call_graph  = ", ".join(
-                f"{s['name']} → ?" for s in symbols
-            ),           # intrafile calls are implicit via symbol list for now
-            code        = code[:6000],  # stay inside context window
+
+# ── Prompt template ───────────────────────────────────────────────────────────
+
+_FUNCTION_PROMPT = """\
+You are a senior engineer performing a combined security, performance, and \
+code-quality review of a single function.
+
+FILE:     {file_path}
+FILE PURPOSE: {file_description}
+FUNCTION: {func_name}  ({kind}, line {start_line})
+
+FUNCTIONS THIS ONE CALLS (already analysed):
+{callee_summaries}
+
+SOURCE:
+{source}
+
+Tasks:
+1. Write a ONE-sentence description of what this function does.
+2. List every security, performance, and code-quality issue you can find.
+   Only report real issues — do not invent problems that aren't there.
+
+Respond ONLY with this exact JSON (no markdown, no extra text):
+{{
+  "description": "<one sentence>",
+  "issues": [
+    {{
+      "pass_type": "security|performance|quality",
+      "type": "<short label>",
+      "severity": "critical|high|medium|low",
+      "line": <int or null>,
+      "description": "<what is wrong>",
+      "fix": "<concrete fix>",
+      "why": "<impact>"
+    }}
+  ]
+}}
+If no issues found return {{"description": "<...>", "issues": []}}
+"""
+
+
+def _format_callee_summaries(summaries: list[dict]) -> str:
+    if not summaries:
+        return "  (none — leaf function)"
+    lines = []
+    for s in summaries:
+        sev_str = (
+            f"  ⚠ {s['issue_count']} issue(s): {', '.join(s['severities'])}"
+            if s["issue_count"] else ""
         )
+        lines.append(f"  • {s['name']}: {s['description']}{sev_str}")
+    return "\n".join(lines)
 
-        raw    = _ollama_chat(prompt)
-        parsed = _extract_json(raw)
 
-        for issue in parsed.get("issues", []):
-            issue["file_path"]   = rel_path
-            issue["symbol_name"] = None
-            issue["pass_type"]   = pass_name
-            all_issues.append(issue)
+# ── Per-function analysis ─────────────────────────────────────────────────────
 
-    return all_issues
+def _analyse_function(
+    symbol:         dict,          # row from get_all_symbols_for_repo
+    repo_path:      str,
+    analysis_cache: dict[str, dict],   # symbol_id → {description, issues}
+) -> dict:
+    """
+    Analyse a single function/class.  Returns a result dict that is stored
+    in analysis_cache and also yielded to the Celery task for DB persistence.
+
+    result dict keys:
+      symbol_id, file_path, symbol_name, pass_type (always "function"),
+      description, issues (list of issue dicts)
+    """
+    rel_path   = symbol["rel_path"]
+    abs_path   = os.path.join(repo_path, rel_path.replace("/", os.sep))
+    start_line = symbol.get("line") or 1
+    end_line   = symbol.get("end_line") or start_line
+    file_id    = symbol["file_id"]
+
+    # -- Extract source -------------------------------------------------------
+    raw_source = _extract_source(abs_path, start_line, end_line)
+    if not raw_source.strip():
+        return {"symbol_id": symbol["symbol_id"], "file_path": rel_path,
+                "symbol_name": symbol["name"], "description": "", "issues": []}
+
+    source, truncated = _truncate_at_line_boundary(raw_source)
+    if truncated:
+        logger.debug("Truncated large function %s in %s", symbol["name"], rel_path)
+
+    # -- Callee summaries (already in cache because we go bottom-up) ----------
+    callee_data = get_callee_summaries(
+        symbol_name=symbol["name"],
+        file_id=file_id,
+        repo_id=symbol["file_id"].rsplit("/", 2)[0] + "/" + symbol["file_id"].rsplit("/", 2)[1]
+            if symbol["file_id"].count("/") >= 2 else symbol["file_id"],
+        analysis_cache=analysis_cache,
+    )
+
+    # -- Build and send prompt ------------------------------------------------
+    prompt = _FUNCTION_PROMPT.format(
+        file_path        = rel_path,
+        file_description = symbol.get("file_description") or "—",
+        func_name        = symbol["name"],
+        kind             = symbol.get("kind", "function"),
+        start_line       = start_line,
+        callee_summaries = _format_callee_summaries(callee_data),
+        source           = source,
+    )
+
+    raw    = _ollama_chat(prompt)
+    parsed = _extract_json(raw)
+
+    description = parsed.get("description", "")
+    issues      = parsed.get("issues", [])
+
+    # Stamp each issue with its origin
+    for issue in issues:
+        issue["file_path"]   = rel_path
+        issue["symbol_name"] = symbol["name"]
+        issue["pass_type"]   = issue.get("pass_type", "quality")
+
+    result = {
+        "symbol_id":   symbol["symbol_id"],
+        "file_path":   rel_path,
+        "symbol_name": symbol["name"],
+        "description": description,
+        "issues":      issues,
+    }
+
+    # Store in cache so callers can reference this analysis
+    analysis_cache[symbol["symbol_id"]] = result
+    # Persist description to Neo4j so the insights endpoint can read it
+    store_function_description(symbol["symbol_id"], description)
+    return result
 
 
 # ── Cross-file (architectural) issues ─────────────────────────────────────────
@@ -221,50 +258,48 @@ def _analyse_file(
 def _cross_file_issues(user_id: str, repo_name: str) -> list[dict]:
     """
     Find architectural issues that span multiple files using the Neo4j graph.
-    These can't be found by looking at a single file.
+    These cannot be found by looking at individual functions.
     """
     issues: list[dict] = []
 
-    # Circular imports
-    circles = find_circular_imports(user_id, repo_name)
-    for c in circles:
+    for c in find_circular_imports(user_id, repo_name):
         issues.append({
             "file_path":     c["file_a"],
             "symbol_name":   None,
             "pass_type":     "quality",
             "severity":      "high",
-            "issue_type":    "circular_import",
+            "type":          "circular_import",
             "description":   f"{c['file_a']} and {c['file_b']} import each other",
-            "suggested_fix": "Extract shared code to a third module to break the cycle",
-            "line_number":   None,
+            "fix":           "Extract shared code to a third module to break the cycle",
+            "why":           "Circular imports cause import errors and make testing hard",
         })
 
-    # Highly coupled files
-    coupled = find_deeply_coupled_files(user_id, repo_name, threshold=5)
-    for c in coupled:
+    for c in find_deeply_coupled_files(user_id, repo_name, threshold=5):
         issues.append({
             "file_path":     c["file_path"],
             "symbol_name":   None,
             "pass_type":     "quality",
             "severity":      "medium",
-            "issue_type":    "high_coupling",
+            "type":          "high_coupling",
             "description":   f"Imported by {c['importers']} files — high blast radius",
-            "suggested_fix": "Consider an interface layer or dependency injection",
-            "line_number":   None,
+            "fix":           "Consider an interface layer or dependency injection",
+            "why":           "A change here breaks many dependents simultaneously",
         })
 
-    # Dead code
-    dead = find_dead_code(user_id, repo_name)
-    for d in dead:
+    # Fixed dead-code query: exclude common entry-point patterns
+    _ENTRY_POINT_NAMES = {"main", "setup", "teardown", "run", "create_app", "app"}
+    for d in find_dead_code(user_id, repo_name):
+        if d["name"] in _ENTRY_POINT_NAMES or d["kind"] == "class":
+            continue
         issues.append({
             "file_path":     d["file_path"],
             "symbol_name":   d["name"],
             "pass_type":     "quality",
             "severity":      "low",
-            "issue_type":    "dead_code",
-            "description":   f"{d['kind']} '{d['name']}' is never called",
-            "suggested_fix": "Remove or add tests/usages for this symbol",
-            "line_number":   None,
+            "type":          "dead_code",
+            "description":   f"{d['kind']} '{d['name']}' is never called internally",
+            "fix":           "Remove or add tests / usages for this symbol",
+            "why":           "Dead code increases maintenance burden and causes confusion",
         })
 
     return issues
@@ -273,59 +308,90 @@ def _cross_file_issues(user_id: str, repo_name: str) -> list[dict]:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_analysis(
-    user_id: str,
+    user_id:   str,
     repo_name: str,
     repo_path: str,
 ) -> Generator[dict, None, None]:
     """
-    Run the full analysis pipeline. Yields progress dicts so the Celery task
-    can track progress and the SSE endpoint can stream updates to the frontend.
+    Run the full bottom-up function-level analysis pipeline.
 
-    Yields: {"stage": str, "file": str, "progress": int, "issues": list}
+    Yields progress dicts so the Celery task can persist results
+    incrementally and the SSE endpoint can stream updates to the frontend.
+
+    Yield shape:
+      {
+        "stage":    "function_analysis" | "cross_file" | "done" | "error",
+        "file":     str,          # rel_path of the file being processed
+        "function": str,          # name of the function just analysed
+        "progress": int,          # 0-100
+        "issues":   list[dict],   # issues found in this batch
+        "description": str,       # LLM description for this function
+      }
     """
-    files = get_all_files_for_repo(user_id, repo_name)
-    total = len(files)
+    # ── Load all symbols and sort them bottom-up ──────────────────────────────
+    all_symbols  = get_all_symbols_for_repo(user_id, repo_name)
+    call_edges   = get_all_call_edges(user_id, repo_name)
+    sorted_syms  = topological_sort_functions(all_symbols, call_edges)
+
+    # Filter to Python only for now (extend to JS when ready)
+    py_symbols = [s for s in sorted_syms if s.get("language") == "python"]
+    total      = len(py_symbols)
 
     if total == 0:
-        yield {"stage": "error", "file": "", "progress": 0,
-               "issues": [], "message": "No files found. Has the graph been built?"}
+        yield {
+            "stage": "error", "file": "", "function": "", "progress": 0,
+            "issues": [], "description": "",
+            "message": "No Python symbols found. Has the graph been built?",
+        }
         return
 
-    all_issues: list[dict] = []
+    logger.info(
+        "Bottom-up analysis | repo=%s/%s | %d functions in topological order",
+        user_id, repo_name, total,
+    )
 
-    # ── Phase 1: per-file analysis ────────────────────────────────────────────
-    for idx, file_info in enumerate(files, start=1):
-        rel_path = file_info["rel_path"]
-        # Only analyse Python for now; extend to JS when ready
-        if file_info.get("language") != "python":
-            continue
+    # Shared cache: symbol_id → {description, issues}
+    # Populated as each function is analysed; passed to callers later.
+    analysis_cache: dict[str, dict] = {}
 
-        issues = _analyse_file(file_info, user_id, repo_name, repo_path)
-        all_issues.extend(issues)
+    # ── Phase 1: per-function analysis (bottom-up) ────────────────────────────
+    for idx, symbol in enumerate(py_symbols, start=1):
+        result   = _analyse_function(symbol, repo_path, analysis_cache)
+        progress = int((idx / total) * 85)   # reserve last 15 % for cross-file
 
-        progress = int((idx / total) * 85)   # reserve last 15% for cross-file
         yield {
-            "stage":    "file_analysis",
-            "file":     rel_path,
-            "progress": progress,
-            "issues":   issues,
+            "stage":       "function_analysis",
+            "file":        result["file_path"],
+            "function":    result["symbol_name"],
+            "progress":    progress,
+            "issues":      result["issues"],
+            "description": result["description"],
         }
 
     # ── Phase 2: cross-file / architectural issues ────────────────────────────
-    yield {"stage": "cross_file", "file": "", "progress": 87, "issues": []}
+    yield {"stage": "cross_file", "file": "", "function": "", "progress": 87,
+           "issues": [], "description": ""}
+
     arch_issues = _cross_file_issues(user_id, repo_name)
-    all_issues.extend(arch_issues)
 
     # ── Phase 3: summary ──────────────────────────────────────────────────────
-    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    all_issues = [
+        issue
+        for result in analysis_cache.values()
+        for issue in result.get("issues", [])
+    ] + arch_issues
+
+    counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for issue in all_issues:
         sev = issue.get("severity", "low")
         counts[sev] = counts.get(sev, 0) + 1
 
     yield {
-        "stage":    "done",
-        "file":     "",
-        "progress": 100,
-        "issues":   arch_issues,
-        "summary":  counts,
+        "stage":       "done",
+        "file":        "",
+        "function":    "",
+        "progress":    100,
+        "issues":      arch_issues,
+        "description": "",
+        "summary":     counts,
     }

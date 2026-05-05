@@ -20,6 +20,7 @@ from src.api.deps import get_current_user, get_db
 from src.models.analysis import AnalysisIssue, AnalysisRun
 from src.models.repo_job import RepoJob
 from src.tasks.analysis_tasks import run_analysis_task
+from src.utils.agents_functions import get_insights_for_repo
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/repo/analyse", tags=["analyse"])
@@ -165,4 +166,144 @@ def get_analysis_issues(
             }
             for i in issues
         ],
+    }
+
+
+@router.get("/insights")
+def get_analysis_insights(
+    repo_name: str     = Query(..., description="Full repo name, e.g. owner/repo"),
+    db:        Session = Depends(get_db),
+    user_id:   str     = Depends(get_current_user),
+):
+    """
+    Return function-level metadata for the latest completed analysis run.
+
+    Joins:
+      - Neo4j: symbol descriptions, call graph (callers/callees per function)
+      - Postgres: issues grouped by function (severity breakdown, full issue list)
+
+    Response shape:
+      {
+        "run_id": str,
+        "summary": { total_functions, functions_with_issues, clean_functions },
+        "files": [
+          {
+            "rel_path": str,
+            "file_description": str,
+            "language": str,
+            "issue_count": int,
+            "max_severity": "critical|high|medium|low|none",
+            "functions": [
+              {
+                "name": str, "kind": str, "line": int, "end_line": int,
+                "description": str,
+                "callers": [str], "callees": [str],
+                "issue_count": int,
+                "severity_breakdown": { critical, high, medium, low },
+                "issues": [ { severity, issue_type, description, suggested_fix, line_number } ]
+              }
+            ]
+          }
+        ]
+      }
+    """
+    # Require a completed run
+    run = (
+        db.query(AnalysisRun)
+        .filter(
+            AnalysisRun.repo_name == repo_name,
+            AnalysisRun.user_id   == str(user_id),
+            AnalysisRun.status    == "DONE",
+        )
+        .order_by(AnalysisRun.started_at.desc())
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed analysis found for this repo")
+
+    # ── Pull all issues from Postgres grouped by (file_path, symbol_name) ───
+    raw_issues = (
+        db.query(AnalysisIssue)
+        .filter(AnalysisIssue.run_id == run.id)
+        .all()
+    )
+    # Index: (file_path, symbol_name) → list[issue_dict]
+    issues_by_fn: dict[tuple, list] = {}
+    for i in raw_issues:
+        key = (i.file_path or "", i.symbol_name or "")
+        issues_by_fn.setdefault(key, []).append({
+            "severity":      i.severity,
+            "issue_type":    i.issue_type,
+            "pass_type":     i.pass_type,
+            "description":   i.description,
+            "suggested_fix": i.suggested_fix,
+            "line_number":   i.line_number,
+        })
+
+    # ── Pull symbol graph data from Neo4j ────────────────────────────────────
+    graph_data = get_insights_for_repo(str(user_id), repo_name)
+    symbols    = graph_data["symbols"]
+
+    # ── Merge and group by file ──────────────────────────────────────────────
+    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
+
+    files_map: dict[str, dict] = {}
+    for sym in symbols:
+        rp = sym["rel_path"]
+        if rp not in files_map:
+            files_map[rp] = {
+                "rel_path":         rp,
+                "file_description": sym.get("file_description") or "",
+                "language":         sym.get("language") or "",
+                "functions":        [],
+            }
+
+        fn_issues = issues_by_fn.get((rp, sym["name"]), [])
+        sev_breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for iss in fn_issues:
+            sev = iss.get("severity", "low")
+            sev_breakdown[sev] = sev_breakdown.get(sev, 0) + 1
+
+        files_map[rp]["functions"].append({
+            "name":               sym["name"],
+            "kind":               sym.get("kind", "function"),
+            "line":               sym.get("line"),
+            "end_line":           sym.get("end_line"),
+            "description":        sym.get("description") or "",
+            "callers":            sym.get("callers", []),
+            "callees":            sym.get("callees", []),
+            "issue_count":        len(fn_issues),
+            "severity_breakdown": sev_breakdown,
+            "issues":             fn_issues,
+        })
+
+    # Compute per-file aggregates
+    files = []
+    for rp, fdata in sorted(files_map.items()):
+        total_issues = sum(fn["issue_count"] for fn in fdata["functions"])
+        # max severity across all functions in this file
+        all_sevs = [
+            iss["severity"]
+            for fn in fdata["functions"]
+            for iss in fn["issues"]
+        ]
+        max_sev = min(all_sevs, key=lambda s: SEV_ORDER.get(s, 4)) if all_sevs else "none"
+        fdata["issue_count"]  = total_issues
+        fdata["max_severity"] = max_sev
+        files.append(fdata)
+
+    # Summary
+    total_fns     = sum(len(f["functions"]) for f in files)
+    fns_w_issues  = sum(
+        1 for f in files for fn in f["functions"] if fn["issue_count"] > 0
+    )
+
+    return {
+        "run_id":  run.id,
+        "summary": {
+            "total_functions":       total_fns,
+            "functions_with_issues": fns_w_issues,
+            "clean_functions":       total_fns - fns_w_issues,
+        },
+        "files": files,
     }

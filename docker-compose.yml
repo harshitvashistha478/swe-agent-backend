@@ -1,0 +1,179 @@
+# ═══════════════════════════════════════════════════════════════════
+#  RepoMind — Docker Compose (infrastructure only)
+#
+#  Services
+#  ─────────────────────────────────────────────────
+#  redis      Redis 7         port 6379
+#  neo4j      Neo4j 5.20      port 7474 (browser) / 7687 (bolt)
+#  api        FastAPI         port 8000
+#  worker     Celery worker   (no exposed port)
+#
+#  PostgreSQL is intentionally excluded — use your local pgAdmin instance.
+#  Set DATABASE_URL in backend/.env to point to it, e.g.:
+#    DATABASE_URL=postgresql://postgres:yourpassword@host.docker.internal:5432/swe_agent
+#  (Use host.docker.internal on Docker Desktop, or your LAN IP on Linux)
+#
+#  Volumes (all named, persisted on the Docker host)
+#  ─────────────────────────────────────────────────
+#  redis_data      /data
+#  neo4j_data      /data
+#  neo4j_logs      /logs
+#  neo4j_plugins   /plugins   (APOC auto-downloaded here on first start)
+#  repos_data      /repos     (cloned git repos, shared by api + worker)
+#
+#  Ollama is also excluded — run it natively for GPU access:
+#    ollama serve
+#  Then set OLLAMA_BASE_URL=http://host.docker.internal:11434 in .env
+#
+#  Quick start
+#  ─────────────────────────────────────────────────
+#  1. cp backend/.env.example backend/.env   # fill in SECRET_KEY + DATABASE_URL
+#  2. docker compose up -d                   # start everything
+#  3. docker compose logs -f api worker      # tail logs
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  # Celery broker + result backend.
+  # AOF persistence (everysec) keeps queue data across restarts without
+  # the performance cost of fsync-on-every-write.
+  redis:
+    image: redis:7-alpine
+    container_name: repomind_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Neo4j 5.20 Community ──────────────────────────────────────────
+  # Community edition of Neo4j 5.11+ includes built-in vector index
+  # support (used for semantic file retrieval via nomic-embed-text).
+  # APOC is auto-downloaded into the plugins volume on first start.
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: repomind_neo4j
+    restart: unless-stopped
+    environment:
+      # Auth: neo4j/<your password> — change NEO4J_PASSWORD in .env
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-repomind_graph}
+
+      # Auto-download APOC plugin (placed in the plugins volume)
+      NEO4J_PLUGINS: '["apoc"]'
+
+      # Memory tuning — adjust to your host RAM
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size:     1G
+      NEO4J_server_memory_pagecache__size:    512m
+
+      # Allow APOC procedures to run unrestricted
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_security_procedures_allowlist:    apoc.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    ports:
+      - "7474:7474"   # Neo4j Browser UI  →  http://localhost:7474
+      - "7687:7687"   # Bolt driver port
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s   # Neo4j takes ~30-60 s to initialise on first boot
+
+  # ── FastAPI Backend ───────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: repomind-api
+    container_name: repomind_api
+    restart: unless-stopped
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: ./backend/.env          # DATABASE_URL points to your local pgAdmin DB
+    environment:
+      # These override the .env values so service names resolve inside Docker
+      CELERY_BROKER_URL:     redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      NEO4J_URI:             bolt://neo4j:7687
+      NEO4J_PASSWORD:        ${NEO4J_PASSWORD:-repomind_graph}
+      REPOS_BASE_PATH:       /repos
+      OLLAMA_BASE_URL:       ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      # DATABASE_URL is intentionally NOT overridden here — it comes from
+      # your .env file and should point to your local pgAdmin PostgreSQL.
+    volumes:
+      - repos_data:/repos        # shared with worker
+      - ./backend/src:/app/src   # hot-reload: code changes take effect instantly
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  # ── Celery Worker ─────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: repomind-api          # reuses the same built image — no double build
+    container_name: repomind_worker
+    restart: unless-stopped
+    command: >
+      celery -A src.worker.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=celery
+    env_file: ./backend/.env
+    environment:
+      CELERY_BROKER_URL:     redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      NEO4J_URI:             bolt://neo4j:7687
+      NEO4J_PASSWORD:        ${NEO4J_PASSWORD:-repomind_graph}
+      REPOS_BASE_PATH:       /repos
+      OLLAMA_BASE_URL:       ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - repos_data:/repos   # same volume as api so worker can read cloned repos
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+    name: repomind_redis_data
+
+  neo4j_data:
+    driver: local
+    name: repomind_neo4j_data
+
+  neo4j_logs:
+    driver: local
+    name: repomind_neo4j_logs
+
+  neo4j_plugins:
+    driver: local
+    name: repomind_neo4j_plugins
+
+  repos_data:
+    driver: local
+    name: repomind_repos_data

@@ -112,6 +112,7 @@ class SymbolInfo:
     name: str
     kind: str        # "function" | "class" | "method"
     line: int
+    end_line: int = 0
 
 
 @dataclass
@@ -163,7 +164,7 @@ class _PythonVisitor(ast.NodeVisitor):
         ) else "function"
         # Simplification: if we're inside a ClassDef mark as method
         kind = "method" if self._in_class else "function"
-        self.symbols.append(SymbolInfo(name=node.name, kind=kind, line=node.lineno))
+        self.symbols.append(SymbolInfo(name=node.name, kind=kind, line=node.lineno, end_line=getattr(node, 'end_lineno', node.lineno)))
         self._defined.add(node.name)
         self._scope_stack.append(node.name)
         self.generic_visit(node)
@@ -175,7 +176,7 @@ class _PythonVisitor(ast.NodeVisitor):
     _in_class = False
 
     def visit_ClassDef(self, node):
-        self.symbols.append(SymbolInfo(name=node.name, kind="class", line=node.lineno))
+        self.symbols.append(SymbolInfo(name=node.name, kind="class", line=node.lineno, end_line=getattr(node, 'end_lineno', node.lineno)))
         self._defined.add(node.name)
         prev = self._in_class
         self._in_class = True
@@ -287,7 +288,7 @@ def _parse_js(abs_path: str, rel_path: str, repo_path: str) -> FileParseResult:
             name = m.group(1) or m.group(2)
             if name:
                 line = src[: m.start()].count("\n") + 1
-                result.symbols.append(SymbolInfo(name=name, kind="function", line=line))
+                result.symbols.append(SymbolInfo(name=name, kind="function", line=line, end_line=line))
 
         # Imports → resolve relative paths only
         for m in _JS_IMPORT_RE.finditer(src):
@@ -443,7 +444,7 @@ MERGE (f)-[:BELONGS_TO]->(r)
 
 _MERGE_SYMBOL = """
 MERGE (s:Symbol {symbol_id: $symbol_id})
-SET s.name = $name, s.kind = $kind, s.line = $line,
+SET s.name = $name, s.kind = $kind, s.line = $line, s.end_line = $end_line,
     s.file_id = $file_id, s.repo_id = $repo_id
 WITH s
 MATCH (f:File {file_id: $file_id})
@@ -554,7 +555,7 @@ def build_repo_graph(repo_path: str, user_id: str, repo_name: str) -> dict:
                 sid = _symbol_id(fid, sym.name)
                 s.run(_MERGE_SYMBOL,
                       symbol_id=sid, name=sym.name, kind=sym.kind,
-                      line=sym.line, file_id=fid, repo_id=repo_id)
+                      line=sym.line, end_line=sym.end_line, file_id=fid, repo_id=repo_id)
                 symbol_count += 1
 
     # 6. Write INTRAFILE edges (function → function calls within same file)

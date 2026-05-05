@@ -1,102 +1,91 @@
-# 🚀 RepoMind Backend — Running Services
+# RepoMind
 
-This guide explains how to run the core services required for the backend:
+RepoMind clones a Git repository, builds a Neo4j knowledge graph of its code, then uses a local LLM (Ollama) to analyse every function — bottom-up through the call graph — for security, performance, and quality issues.
 
-* Redis (message broker)
-* Celery workers (background jobs)
-* FastAPI server (API layer)
+**Stack:** FastAPI · Celery · PostgreSQL · Redis · Neo4j · React · Ollama
 
 ---
 
-## 🧱 Prerequisites
+## Prerequisites
 
-Make sure you have:
-
-* Docker installed (for Redis)
-* Python environment activated
-* Dependencies installed (`pip install -r requirements.txt`)
+- Python 3.12+, Node 18+, Docker Desktop, Git
+- PostgreSQL running locally via pgAdmin (`swe_agent` database created)
+- [Ollama](https://ollama.com) installed and running
 
 ---
 
-## ▶️ Start Services
-
-### 1️⃣ Start Redis (Broker)
+## 1 — Environment
 
 ```bash
-docker run -d -p 6379:6379 redis
+cp .env.example .env
+```
+
+Fill in `.env`:
+
+```env
+DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/swe_agent
+SECRET_KEY=<run: openssl rand -hex 64>
+NEO4J_PASSWORD=repomind_graph   # must match docker-compose.yml
+REPOS_BASE_PATH=C:/repomind-repos
+```
+
+Everything else can stay as the defaults in `.env.example`.
+
+---
+
+## 2 — Ollama models
+
+```bash
+ollama pull qwen2.5-coder:0.5b   # file descriptions
+ollama pull nomic-embed-text      # embeddings
+ollama pull llama3.1:8b           # analysis + chat
 ```
 
 ---
 
-### 2️⃣ Start Celery Worker
+## 3 — Start Redis and Neo4j
 
 ```bash
-celery -A src.worker.celery_app worker --loglevel=info
+docker compose up -d redis neo4j
 ```
 
-> ⚠️ If you're on Windows, use:
-
-```bash
-celery -A src.worker.celery_app worker --pool=solo --loglevel=info
-```
+Neo4j takes ~60 seconds on first boot. Watch with `docker compose logs -f neo4j`.
 
 ---
 
-### 3️⃣ Run FastAPI Server
+## 4 — Backend
 
 ```bash
+python -m venv .venv && .venv\Scripts\activate   # Windows
+# source .venv/bin/activate                       # Mac/Linux
+
+pip install -r requirements.txt
+alembic upgrade head
 uvicorn src.main:app --reload
 ```
 
 ---
 
-## ⚡ Running Multiple Workers
+## 5 — Celery worker
 
-To scale background processing:
+Open a second terminal:
 
 ```bash
-celery -A src.worker.celery_app worker --loglevel=info --concurrency=4
+.venv\Scripts\activate
+celery -A src.worker.celery_app worker --loglevel=info
+
+# Windows (if you hit multiprocessing errors)
+celery -A src.worker.celery_app worker --pool=solo --loglevel=info
 ```
 
-* `--concurrency=4` → runs 4 worker processes
-* Adjust based on your CPU cores
-
 ---
 
-## 🧠 Notes
+## 6 — Frontend
 
-* Redis must be running before starting Celery
-* Celery workers must be running for background jobs (repo import, etc.)
-* FastAPI handles API requests, Celery handles heavy tasks
+```bash
+cd ../frontend
+npm install
+npm run dev
+```
 
----
-
-## 🛠️ Common Issues
-
-### ❌ Tasks not executing
-
-* Ensure Redis is running
-* Ensure Celery worker is active
-
-### ❌ Connection refused (Redis)
-
-* Check if port `6379` is available
-* Restart container if needed
-
-### ❌ Windows multiprocessing issues
-
-* Use `--pool=solo`
-
----
-
-## 🔜 Next Steps
-
-* Add monitoring (Flower for Celery)
-* Add Docker Compose for full stack setup
-* Integrate ingestion pipeline after repo cloning
-
----
-
-ollama pull qwen2.5-coder:0.5b   # file descriptions (fast, tiny)
-ollama pull nomic-embed-text       # embeddings (768-dim)
-ollama pull llama3.1:8b            # chat Q&A
+App at **http://localhost:5173** · API docs at **http://localhost:8000/api/docs** · Neo4j at **http://localhost:7474**
